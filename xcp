@@ -1,0 +1,1036 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import selectors
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+from typing import BinaryIO, Iterable
+
+
+class UserError(Exception):
+    pass
+
+
+@dataclass
+class LocalFile:
+    rel_path: str
+    size: int
+    usage: int
+
+
+
+@dataclass
+class Node:
+    rel_path: str
+    local_size: int = 0
+    local_usage: int = 0
+    local_file_count: int = 0
+    local_files: list[LocalFile] = field(default_factory=list)
+    children: list["Node"] = field(default_factory=list)
+
+
+RSYNC_PRESERVE_OPTIONS = [
+    "--recursive",
+    "--links",
+    "--hard-links",
+    "--perms",
+    "--times",
+    "--group",
+    "--owner",
+    "--devices",
+    "--specials",
+    "--numeric-ids",
+]
+
+
+@dataclass(frozen=True)
+class RsyncCapabilities:
+    supports_info_progress2: bool
+    supports_progress: bool
+    supports_out_format: bool
+    supports_itemize_changes: bool
+
+
+@lru_cache(maxsize=1)
+def detect_rsync_capabilities() -> RsyncCapabilities:
+    try:
+        completed = subprocess.run(
+            ["rsync", "--help"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except FileNotFoundError as error:
+        raise UserError("rsync is not installed or not on PATH") from error
+
+    help_text = completed.stdout or ""
+    return RsyncCapabilities(
+        supports_info_progress2="--info=progress2" in help_text,
+        supports_progress="--progress" in help_text,
+        supports_out_format="--out-format" in help_text,
+        supports_itemize_changes="--itemize-changes" in help_text,
+    )
+
+
+def parse_size(value: str) -> int:
+    text = value.strip()
+    if not text:
+        raise UserError("size must not be empty")
+
+    match = re.match(r"^\s*(\d+(?:\.\d+)?|\.\d+)", text)
+    if not match:
+        raise UserError(f"invalid size: {value}")
+
+    number = float(match.group(1))
+    suffix = text[match.end() :].strip().upper()
+    factors = {
+        "": 1,
+        "B": 1,
+        "K": 1024,
+        "KB": 1024,
+        "KI": 1024,
+        "KIB": 1024,
+        "M": 1024**2,
+        "MB": 1024**2,
+        "MI": 1024**2,
+        "MIB": 1024**2,
+        "G": 1024**3,
+        "GB": 1024**3,
+        "GI": 1024**3,
+        "GIB": 1024**3,
+        "T": 1024**4,
+        "TB": 1024**4,
+        "TI": 1024**4,
+        "TIB": 1024**4,
+        "P": 1024**5,
+        "PB": 1024**5,
+        "PI": 1024**5,
+        "PIB": 1024**5,
+    }
+
+    factor = factors.get(suffix)
+    if factor is None:
+        raise UserError(f"unsupported size suffix: {suffix}")
+
+    size = int(number * factor)
+    if size <= 0:
+        raise UserError("size must be greater than zero")
+
+    return size
+
+
+def human_size(size: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    value = float(size)
+    unit = units[0]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            break
+        value /= 1024
+
+    if unit == "B" or value >= 10:
+        return f"{value:.0f}{unit}"
+    return f"{value:.1f}{unit}"
+
+
+def format_size_usage_label(size: int, usage: int) -> str:
+    return f"{human_size(size)}/{human_size(usage)}"
+
+
+def format_count_label(file_count: int, dir_count: int) -> str:
+    return f"{dir_count}/{file_count}"
+
+
+def format_root_label(path: str) -> str:
+    normalized = os.path.normpath(path)
+    if normalized == ".":
+        return "./"
+    return f"{normalized}/"
+
+
+def format_rule_path(rel_path: str) -> str | None:
+    if rel_path == "./":
+        return None
+    return f"**/{rel_path}"
+
+
+def load_excludes(path: str | None) -> list[str]:
+    if path is None:
+        return []
+
+    excludes: list[str] = []
+    for line_number, raw_line in enumerate(Path(path).read_text().splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("- "):
+            line = line[2:].strip()
+        if line.startswith("+ ") or line.startswith("!"):
+            raise UserError(
+                f"unsupported exclude rule on line {line_number} of {path}: {raw_line}"
+            )
+
+        normalized = normalize_exclude_pattern(line)
+        if not normalized:
+            raise UserError(f"invalid exclude entry on line {line_number} of {path}: {raw_line}")
+        excludes.append(normalized)
+
+    return excludes
+
+
+def normalize_relative_entry(value: str) -> str:
+    text = value.strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    while "//" in text:
+        text = text.replace("//", "/")
+    if text in {"", "."}:
+        return ""
+    if text.startswith("/"):
+        raise UserError(f"exclude entries must be relative: {value}")
+    return text.rstrip("/")
+
+
+def normalize_exclude_pattern(value: str) -> str:
+    text = value.strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    while "//" in text:
+        text = text.replace("//", "/")
+    if text.startswith("/"):
+        raise UserError(f"exclude entries must be relative patterns: {value}")
+    return text
+
+
+def compile_glob(pattern: str) -> re.Pattern[str]:
+    regex_parts: list[str] = ["^"]
+    i = 0
+    while i < len(pattern):
+        char = pattern[i]
+        if pattern[i : i + 3] == "**/":
+            regex_parts.append("(?:.*/)?")
+            i += 3
+        elif pattern[i : i + 2] == "**":
+            regex_parts.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            regex_parts.append("[^/]*")
+            i += 1
+        elif char == "?":
+            regex_parts.append("[^/]")
+            i += 1
+        else:
+            regex_parts.append(re.escape(char))
+            i += 1
+    regex_parts.append("$")
+    return re.compile("".join(regex_parts))
+
+
+def matches_pattern(path: str, pattern: str) -> bool:
+    return compile_glob(pattern).match(path) is not None
+
+
+def stat_usage_bytes(stat_result: os.stat_result) -> int:
+    blocks = getattr(stat_result, "st_blocks", None)
+    if blocks is not None:
+        return max(0, int(blocks) * 512)
+    return stat_result.st_size
+
+
+def is_excluded(rel_path: str, is_dir: bool, excludes: Iterable[str]) -> bool:
+    if not rel_path:
+        return False
+
+    prefixes = rel_path.split("/")
+    candidate_dirs = ["/".join(prefixes[:index]) for index in range(1, len(prefixes) + 1)]
+    if not is_dir:
+        candidate_dirs = candidate_dirs[:-1]
+
+    for exclude in excludes:
+        if exclude.endswith("/"):
+            target = exclude.rstrip("/")
+            if any(matches_pattern(candidate, target) for candidate in candidate_dirs):
+                return True
+        elif matches_pattern(rel_path, exclude):
+            return True
+
+    return False
+
+
+def walk_tree(root: Path, excludes: list[str], warnings: list[str], rel_path: str = "") -> Node:
+    try:
+        root_stat = root.stat(follow_symlinks=False)
+        entries = sorted(os.scandir(root), key=lambda entry: entry.name)
+    except OSError as error:
+        raise UserError(f"failed to read directory {root}: {error}") from error
+    node = Node(rel_path=rel_path, local_usage=stat_usage_bytes(root_stat))
+
+    for entry in entries:
+        child_rel = entry.name if not rel_path else f"{rel_path}/{entry.name}"
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                if is_excluded(child_rel, True, excludes):
+                    continue
+                node.children.append(walk_tree(Path(entry.path), excludes, warnings, child_rel))
+                continue
+
+            if is_excluded(child_rel, False, excludes):
+                continue
+
+            stat_result = entry.stat(follow_symlinks=False)
+            if entry.is_file(follow_symlinks=False) or entry.is_symlink():
+                usage = stat_usage_bytes(stat_result)
+                node.local_size += stat_result.st_size
+                node.local_usage += usage
+                node.local_file_count += 1
+                node.local_files.append(LocalFile(child_rel, stat_result.st_size, usage))
+        except OSError as error:
+            warnings.append(f"warning: skipped {entry.path}: {error}")
+
+    return node
+
+
+def collect_hits(
+    node: Node,
+    threshold: int,
+    hits: list[tuple[int, int, str, int, int]],
+) -> tuple[int, int, int, int]:
+    residual = 0
+    residual_usage = 0
+    residual_file_count = 0
+    residual_dir_count = 0
+    for local_file in node.local_files:
+        if local_file.size >= threshold:
+            hits.append((local_file.size, local_file.usage, local_file.rel_path, 1, 0))
+            continue
+        residual += local_file.size
+        residual_usage += local_file.usage
+        residual_file_count += 1
+
+    for child in node.children:
+        child_size, child_usage, child_file_count, child_dir_count = collect_hits(child, threshold, hits)
+        if child_size > 0:
+            residual += child_size
+            residual_usage += child_usage
+            residual_file_count += child_file_count
+            residual_dir_count += child_dir_count + 1
+
+    if residual >= threshold:
+        display = "./" if not node.rel_path else f"{node.rel_path}/"
+        hits.append((residual, residual_usage, display, residual_file_count, residual_dir_count))
+        return 0, 0, 0, 0
+
+    return residual, residual_usage, residual_file_count, residual_dir_count
+
+
+def build_rsync_command(source: str, dest: str, exclude_from: str | None) -> list[str]:
+    command = ["rsync", *RSYNC_PRESERVE_OPTIONS]
+    if exclude_from:
+        command.extend(["--exclude-from", exclude_from])
+    command.extend([source, dest])
+    return command
+
+
+def is_rsync_remote(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", value) or "::" in value or re.match(r"^[^/]+:", value))
+
+
+def normalize_copy_source(source: str) -> str:
+    if re.fullmatch(r"/+", source):
+        return "/"
+
+    normalized = source if is_rsync_remote(source) else os.path.expanduser(source)
+    while len(normalized) > 1 and normalized.endswith("/"):
+        if re.fullmatch(r".+:/", normalized):
+            break
+        normalized = normalized[:-1]
+    return normalized
+
+
+def source_basename(source: str) -> str:
+    normalized = normalize_copy_source(source)
+    if normalized == "/":
+        raise UserError("cannot copy filesystem root as a named directory")
+
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", normalized):
+        path_part = normalized.rsplit("/", 1)[-1]
+    elif "::" in normalized:
+        path_part = normalized.rsplit("/", 1)[-1]
+    elif re.match(r"^[^/]+:", normalized):
+        path_part = normalized.split(":", 1)[1].rsplit("/", 1)[-1]
+    else:
+        path_part = os.path.basename(normalized)
+
+    if not path_part:
+        raise UserError(f"cannot determine source directory name: {source}")
+    return path_part
+
+
+def source_rsync_arg(source: str) -> str:
+    normalized = normalize_copy_source(source)
+    if normalized == "/":
+        return normalized
+    if re.fullmatch(r".+:/", normalized):
+        return normalized
+    if is_rsync_remote(normalized):
+        return normalized + "/"
+
+    source_path = Path(normalized)
+    if source_path.exists():
+        if source_path.is_dir():
+            return normalized + "/"
+        return normalized
+
+    return normalized
+
+
+def strip_one_trailing_slash(value: str) -> str:
+    if re.fullmatch(r"/+", value):
+        return "/"
+    if re.fullmatch(r"[^:]+:/", value):
+        return value[:-1]
+    return value[:-1] if value.endswith("/") else value
+
+
+def join_rsync_dest(parent: str, child: str) -> str:
+    if parent in {"", "."}:
+        return child + "/"
+    if parent == "/":
+        return "/" + child + "/"
+    if re.fullmatch(r"[^/]+:/", parent):
+        return parent + child + "/"
+    stripped = strip_one_trailing_slash(parent)
+    if stripped.endswith(":"):
+        return stripped + child + "/"
+    return stripped + "/" + child + "/"
+
+
+def dest_rsync_arg(source: str, dest: str) -> str:
+    expanded_dest = dest if is_rsync_remote(dest) else os.path.expanduser(dest)
+    if expanded_dest.endswith("/"):
+        return join_rsync_dest(expanded_dest, source_basename(source))
+    return strip_one_trailing_slash(expanded_dest) + "/"
+
+
+def subtree_stats(node: Node) -> tuple[int, int, int, int]:
+    size = node.local_size
+    usage = node.local_usage
+    file_count = node.local_file_count
+    dir_count = 0
+    for child in node.children:
+        child_size, child_usage, child_dir_count, child_file_count = subtree_stats(child)
+        size += child_size
+        usage += child_usage
+        dir_count += child_dir_count + 1
+        file_count += child_file_count
+    return size, usage, dir_count, file_count
+
+
+def format_summary(total_before_size: int, total_before_usage: int, total_after_size: int, total_after_usage: int) -> str:
+    excluded_size = total_before_size - total_after_size
+    excluded_usage = total_before_usage - total_after_usage
+    return (
+        f"total {format_size_usage_label(total_before_size, total_before_usage)}  "
+        f"kept {format_size_usage_label(total_after_size, total_after_usage)}  "
+        f"excluded {format_size_usage_label(excluded_size, excluded_usage)}"
+    )
+
+
+def write_rsync_exclude_file(patterns: list[str]) -> str:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix="xcp-rsync-excludes.",
+        suffix=".txt",
+        dir="/tmp",
+        delete=False,
+        encoding="utf-8",
+    ) as handle:
+        for pattern in patterns:
+            handle.write(pattern)
+            handle.write("\n")
+        return handle.name
+
+
+@contextmanager
+def managed_temp_paths(paths: list[str], process_ref: list[subprocess.Popen[str] | None]):
+    def cleanup() -> None:
+        for path in paths:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    previous_handlers: dict[signal.Signals, object] = {}
+
+    def handle_signal(signum: int, _frame: object) -> None:
+        cleanup()
+        process = process_ref[0]
+        if process is not None and process.poll() is None:
+            process.send_signal(signum)
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, handle_signal)
+
+    try:
+        yield
+    finally:
+        cleanup()
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+
+
+def collapse_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def looks_like_path_listing(text: str) -> bool:
+    if any(ch.isspace() for ch in text):
+        return False
+    if text.startswith("rsync:"):
+        return False
+    return "/" in text or text.endswith(":")
+
+
+def translate_itemized_line(code: str, payload: str, *, dry_run: bool) -> str | None:
+    action_code = code[0]
+    type_code = code[1]
+
+    if action_code == "." and set(code[2:]) <= {".", " "}:
+        return None
+
+    if not dry_run:
+        return None
+
+    if type_code != "d":
+        return None
+    if "+" in code or action_code == "c":
+        return f"create   {payload}"
+    return f"sync     {payload}"
+
+
+def parse_progress_bytes(text: str) -> int | None:
+    match = re.match(r"^\s*(\d[\d,]*)\s+\d+%", text)
+    if not match:
+        return None
+    return int(match.group(1).replace(",", ""))
+
+
+def parse_rate_bytes_per_second(text: str) -> float | None:
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([KMGTP]?)(?:i?B|B)/s", text)
+    if not match:
+        return None
+
+    value = float(match.group(1))
+    unit = match.group(2)
+    multipliers = {
+        "": 1.0,
+        "K": 1024.0,
+        "M": 1024.0**2,
+        "G": 1024.0**3,
+        "T": 1024.0**4,
+        "P": 1024.0**5,
+    }
+    return value * multipliers[unit]
+
+
+def format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def estimate_remaining(total_size: int | None, copied_size: int, elapsed: float, reported_rate: float | None) -> str:
+    if total_size is None or total_size <= 0 or copied_size <= 0 or copied_size >= total_size:
+        return "00:00:00" if total_size is not None and copied_size >= total_size else "--:--:--"
+    rate = reported_rate if reported_rate is not None and reported_rate > 0 else copied_size / max(elapsed, 0.001)
+    if rate <= 0:
+        return "--:--:--"
+    return format_duration((total_size - copied_size) / rate)
+
+
+def update_progress_state(text: str, state: dict[str, object]) -> str:
+    compact = collapse_whitespace(text)
+    totals = state.get("totals")
+    transferred = parse_progress_bytes(compact)
+    reported_rate = parse_rate_bytes_per_second(compact)
+
+    if transferred is None:
+        return f"progress {compact}"
+
+    state["phase"] = "transfer"
+    now = time.monotonic()
+    if state.get("transfer_started_at") is None:
+        state["transfer_started_at"] = now
+    elapsed = now - float(state["transfer_started_at"])
+
+    if totals is None:
+        parts = [f"progress {human_size(transferred)}", f"elapsed {format_duration(elapsed)}"]
+        if reported_rate is not None and reported_rate > 0:
+            parts.append(f"rate {human_size(int(reported_rate))}/s")
+        return "  ".join(parts)
+
+    total_size, total_usage = totals
+    mode = state.get("mode", "overall")
+    if mode == "per-file":
+        current_bytes = int(state.get("current_bytes", 0))
+        completed_bytes = int(state.get("completed_bytes", 0))
+        if transferred < current_bytes:
+            completed_bytes += current_bytes
+            current_bytes = transferred
+        else:
+            current_bytes = max(current_bytes, transferred)
+        state["completed_bytes"] = completed_bytes
+        state["current_bytes"] = current_bytes
+        copied_size = min(total_size, completed_bytes + current_bytes)
+    else:
+        copied_size = min(total_size, transferred)
+
+    ratio = 0.0 if total_size <= 0 else min(1.0, copied_size / total_size)
+    copied_usage = int(total_usage * ratio)
+    state["copied_size"] = copied_size
+    state["copied_usage"] = copied_usage
+    state["remaining"] = estimate_remaining(total_size, copied_size, elapsed, reported_rate)
+
+    parts = [
+        f"progress {human_size(copied_size)}/{human_size(total_size)}",
+        f"elapsed {format_duration(elapsed)}",
+        f"remaining {state['remaining']}",
+    ]
+    if reported_rate is not None and reported_rate > 0:
+        parts.append(f"rate {human_size(int(reported_rate))}/s")
+    return "  ".join(parts)
+
+
+def translate_file_list_progress(text: str) -> str | None:
+    match = re.match(r"^(\d+) files(?:\.\.\.| to consider)$", text)
+    if not match:
+        return None
+    count = int(match.group(1))
+    if text.endswith("to consider"):
+        return f"scanned {count:,} files"
+    return f"scanning {count:,} files"
+
+
+def translate_rsync_line(
+    line: str,
+    *,
+    progress: bool,
+    progress_state: dict[str, object],
+    dry_run: bool,
+) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+    if stripped == "sending incremental file list":
+        return None
+
+    if progress:
+        file_list_progress = translate_file_list_progress(stripped)
+        if file_list_progress:
+            progress_state["phase"] = "scan"
+            return ("progress", file_list_progress)
+        if stripped == "building file list ...":
+            progress_state["phase"] = "scan"
+            return ("progress", "building file list")
+
+    itemized_match = re.match(r"^(?P<code>\S+)\|(?P<payload>.+)$", stripped)
+    if itemized_match:
+        translated = translate_itemized_line(
+            itemized_match.group("code"),
+            itemized_match.group("payload"),
+            dry_run=dry_run,
+        )
+        if translated:
+            return ("line", translated)
+        return None
+
+    if progress and ("to-chk=" in stripped or "%" in stripped):
+        return ("progress", update_progress_state(stripped, progress_state))
+
+    if stripped.startswith("sent ") or stripped.startswith("total size is "):
+        return ("line", collapse_whitespace(stripped))
+
+    if looks_like_path_listing(stripped):
+        return None
+
+    return ("line", stripped)
+
+
+def drain_stream_buffer(buffer: bytes, *, final: bool) -> tuple[list[str], bytes]:
+    lines: list[str] = []
+    start = 0
+    for index, byte in enumerate(buffer):
+        if byte in (10, 13):
+            chunk = buffer[start:index]
+            if chunk:
+                lines.append(chunk.decode("utf-8", errors="replace"))
+            start = index + 1
+    remaining = buffer[start:]
+    if final and remaining:
+        lines.append(remaining.decode("utf-8", errors="replace"))
+        remaining = b""
+    return lines, remaining
+
+
+def clear_progress_line(state: dict[str, int]) -> None:
+    if state["active"]:
+        width = state["width"]
+        sys.stdout.write("\r" + (" " * width) + "\r")
+        sys.stdout.flush()
+        state["active"] = 0
+        state["width"] = 0
+
+
+def emit_progress_line(text: str, state: dict[str, int]) -> None:
+    width = max(state["width"], len(text))
+    padded = text.ljust(width)
+    sys.stdout.write("\r" + padded)
+    sys.stdout.flush()
+    state["active"] = 1
+    state["width"] = width
+    state["text"] = text
+
+
+def finalize_progress_line(state: dict[str, object]) -> None:
+    if state["active"]:
+        width = state["width"]
+        totals = state.get("totals")
+        copied_size = int(state.get("copied_size", 0))
+        if totals is not None and copied_size > 0:
+            total_size, _total_usage = totals
+            started_at = state.get("transfer_started_at") or state.get("started_at")
+            elapsed = time.monotonic() - float(started_at)
+            text = (
+                f"complete {human_size(copied_size)}/{human_size(total_size)}"
+                f"  elapsed {format_duration(elapsed)}"
+            )
+        else:
+            if state.get("phase") == "scan":
+                sys.stdout.write("\r" + (" " * width) + "\r")
+                sys.stdout.flush()
+                state["active"] = 0
+                state["width"] = 0
+                return
+            text = state.get("text", "")
+        sys.stdout.write("\r" + str(text).ljust(width) + "\n")
+        sys.stdout.flush()
+        state["active"] = 0
+        state["width"] = 0
+
+
+def emit_output(event: tuple[str, str], progress_state: dict[str, object]) -> None:
+    kind, text = event
+    if kind == "progress":
+        emit_progress_line(text, progress_state)
+        return
+
+    clear_progress_line(progress_state)
+    print(text)
+
+
+def run_rsync(
+    command: list[str],
+    *,
+    progress: bool,
+    process_ref: list[subprocess.Popen[bytes] | None],
+    progress_state: dict[str, object],
+    dry_run: bool,
+) -> int:
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+    except FileNotFoundError as error:
+        raise UserError("rsync is not installed or not on PATH") from error
+
+    process_ref[0] = process
+    selector = selectors.DefaultSelector()
+    assert process.stdout is not None
+    assert process.stderr is not None
+    selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(process.stderr, selectors.EVENT_READ)
+    buffers: dict[BinaryIO, bytes] = {
+        process.stdout: b"",
+        process.stderr: b"",
+    }
+    try:
+        while selector.get_map():
+            for key, _ in selector.select():
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 8192)
+                if not chunk:
+                    selector.unregister(stream)
+                    lines, remaining = drain_stream_buffer(buffers[stream], final=True)
+                    for line in lines:
+                        event = translate_rsync_line(
+                            line,
+                            progress=progress,
+                            progress_state=progress_state,
+                            dry_run=dry_run,
+                        )
+                        if event:
+                            emit_output(event, progress_state)
+                    buffers[stream] = remaining
+                    stream.close()
+                    continue
+
+                buffers[stream] += chunk
+                lines, remaining = drain_stream_buffer(buffers[stream], final=False)
+                buffers[stream] = remaining
+                for line in lines:
+                    event = translate_rsync_line(
+                        line,
+                        progress=progress,
+                        progress_state=progress_state,
+                        dry_run=dry_run,
+                    )
+                    if event:
+                        emit_output(event, progress_state)
+    finally:
+        finalize_progress_line(progress_state)
+        selector.close()
+
+    return process.wait()
+
+
+def cmd_ls(args: argparse.Namespace) -> int:
+    exclude_from = getattr(args, "exclude_from", None)
+    root = Path(args.path)
+    if not root.is_dir():
+        raise UserError(f"not a directory: {args.path}")
+
+    threshold = parse_size(args.size)
+    excludes = load_excludes(exclude_from)
+    warnings: list[str] = []
+    full_tree = walk_tree(root, [], warnings)
+    tree = walk_tree(root, excludes, warnings)
+    hits: list[tuple[int, int, str, int, int]] = []
+    collect_hits(tree, threshold, hits)
+    display_hits = [
+        (size, usage, rule_path, file_count, dir_count)
+        for size, usage, rel_path, file_count, dir_count in hits
+        if (rule_path := format_rule_path(rel_path)) is not None
+    ]
+    tree_size, tree_usage, _, _ = subtree_stats(tree)
+    full_size, full_usage, _, _ = subtree_stats(full_tree)
+    if not display_hits and tree_size >= threshold:
+        display_hits = [
+            (size, usage, rule_path, file_count, dir_count)
+            for child in tree.children
+            if (stats := subtree_stats(child))
+            if (size := stats[0]) >= threshold
+            if (usage := stats[1]) >= 0
+            if (rule_path := format_rule_path(f"{child.rel_path}/")) is not None
+            for _, _, dir_count, file_count in [stats]
+        ]
+
+    if args.sort == "size":
+        display_hits.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    else:
+        display_hits.sort(key=lambda item: item[2])
+    size_width = max((len(format_size_usage_label(size, usage)) for size, usage, _, _, _ in display_hits), default=0)
+    count_width = max(
+        (len(format_count_label(file_count, dir_count)) for _, _, _, file_count, dir_count in display_hits),
+        default=0,
+    )
+    for size, usage, display_path, file_count, dir_count in display_hits:
+        size_label = format_size_usage_label(size, usage)
+        count_label = format_count_label(file_count, dir_count)
+        print(f"{size_label:>{size_width}}  {count_label:>{count_width}}  {display_path}")
+
+    if exclude_from:
+        print(format_summary(full_size, full_usage, tree_size, tree_usage))
+
+    for warning in warnings:
+        print(warning, file=sys.stderr)
+
+    return 0
+
+
+def cmd_rsync(args: argparse.Namespace) -> int:
+    capabilities = detect_rsync_capabilities()
+    exclude_from = getattr(args, "exclude_from", None)
+    exclude_patterns = load_excludes(exclude_from)
+    temp_paths: list[str] = []
+    rsync_exclude_path: str | None = None
+    if exclude_patterns:
+        rsync_exclude_path = write_rsync_exclude_file(exclude_patterns)
+        temp_paths.append(rsync_exclude_path)
+
+    source = normalize_copy_source(args.source)
+    dest = dest_rsync_arg(source, args.dest)
+    command = build_rsync_command(source_rsync_arg(source), dest, rsync_exclude_path)
+    if args.dry_run:
+        command.append("--dry-run")
+    if not args.dry_run:
+        if capabilities.supports_info_progress2:
+            command.append("--info=progress2")
+        elif capabilities.supports_progress:
+            command.append("--progress")
+    if capabilities.supports_itemize_changes:
+        command.append("--itemize-changes")
+    if capabilities.supports_out_format:
+        command.append("--out-format=%i|%n%L")
+
+    process_ref: list[subprocess.Popen[bytes] | None] = [None]
+    with managed_temp_paths(temp_paths, process_ref):
+        progress_totals: tuple[int, int] | None = None
+        if exclude_from:
+            source_path = Path(source)
+            if source_path.is_dir():
+                warnings: list[str] = []
+                full_tree = walk_tree(source_path, [], warnings)
+                filtered_tree = walk_tree(source_path, exclude_patterns, warnings)
+                full_size, full_usage, _, _ = subtree_stats(full_tree)
+                filtered_size, filtered_usage, _, _ = subtree_stats(filtered_tree)
+                print(format_summary(full_size, full_usage, filtered_size, filtered_usage))
+                progress_totals = (filtered_size, filtered_usage)
+                for warning in warnings:
+                    print(warning, file=sys.stderr)
+
+        progress_mode = "overall" if capabilities.supports_info_progress2 else "per-file"
+        progress_state: dict[str, object] = {
+            "active": 0,
+            "width": 0,
+            "text": "",
+            "totals": progress_totals,
+            "started_at": time.monotonic(),
+            "mode": progress_mode,
+            "completed_bytes": 0,
+            "current_bytes": 0,
+            "copied_size": 0,
+            "copied_usage": 0,
+            "rate_bps": None,
+            "transfer_started_at": None,
+            "remaining": "--:--:--",
+            "phase": "idle",
+        }
+
+        return run_rsync(
+            command,
+            progress=not args.dry_run,
+            process_ref=process_ref,
+            progress_state=progress_state,
+            dry_run=args.dry_run,
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="xcp",
+        usage="xcp [options] <command> [args]",
+        description="Find large residual paths, tune excludes, then copy with rsync.",
+    )
+    parser.add_argument(
+        "-x",
+        "--exclude-from",
+        metavar="exclude-file",
+        default=argparse.SUPPRESS,
+        help="Read shared exclude patterns from exclude-file.",
+    )
+    parser._positionals.title = "commands"
+    subparsers = parser.add_subparsers(dest="command", metavar="<command>")
+
+    ls_parser = subparsers.add_parser(
+        "ls",
+        usage="xcp [options] ls PATH SIZE",
+        help="list retained paths at or above a size threshold",
+        description="List retained paths at or above SIZE.",
+    )
+    ls_parser.add_argument("path", help="Directory to analyze.")
+    ls_parser.add_argument("size", help="Threshold, such as 10M, 500MiB, or 1073741824.")
+    ls_parser.add_argument(
+        "-s",
+        "--sort",
+        choices=("path", "size"),
+        default="path",
+        help="Sort output by path or descending size (default: path).",
+    )
+    ls_parser.set_defaults(handler=cmd_ls)
+
+    cp_parser = subparsers.add_parser(
+        "cp",
+        usage="xcp [options] cp SOURCE DEST [-n]",
+        help="copy source contents into dest",
+        description="Copy SOURCE contents into DEST using rsync.",
+    )
+    cp_parser.add_argument("source", help="Source path. Trailing slashes are ignored.")
+    cp_parser.add_argument("dest", help="Destination root path.")
+    cp_parser.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="Preview the rsync operation without copying files.",
+    )
+    cp_parser.set_defaults(handler=cmd_rsync)
+
+    return parser
+
+
+def normalize_global_options(argv: list[str]) -> list[str]:
+    normalized: list[str] = []
+    remaining: list[str] = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in {"-x", "--exclude-from"}:
+            if index + 1 >= len(argv):
+                remaining.append(arg)
+                index += 1
+                continue
+            normalized.extend([arg, argv[index + 1]])
+            index += 2
+            continue
+
+        if arg.startswith("--exclude-from="):
+            normalized.append(arg)
+            index += 1
+            continue
+
+        remaining.append(arg)
+        index += 1
+
+    return normalized + remaining
+
+
+def main() -> int:
+    parser = build_parser()
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return 0
+    argv = normalize_global_options(sys.argv[1:])
+    args = parser.parse_args(argv)
+    if not hasattr(args, "handler"):
+        parser.print_help()
+        return 2
+    try:
+        return args.handler(args)
+    except UserError as error:
+        print(f"xcp: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
